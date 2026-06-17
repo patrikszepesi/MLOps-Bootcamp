@@ -1,0 +1,7 @@
+sagemaker>=2.245.0
+boto3>=1.34.0
+datasets>=2.18.0
+matplotlib>=3.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+requests>=2.31.0

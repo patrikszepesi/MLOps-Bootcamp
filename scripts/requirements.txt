@@ -1,0 +1,5 @@
+datasets>=2.18.0
+transformers>=4.36.0,<4.37.0
+accelerate>=0.25.0
+Pillow>=10.0.0
+numpy>=1.24.0
