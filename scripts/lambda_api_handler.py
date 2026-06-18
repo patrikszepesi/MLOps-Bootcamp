@@ -9,7 +9,6 @@ from pathlib import PurePosixPath
 import boto3
 from botocore.exceptions import ClientError
 
-
 runtime = boto3.client("sagemaker-runtime")
 bedrock = boto3.client("bedrock-runtime")
 s3 = boto3.client("s3")
@@ -32,24 +31,29 @@ DEFAULT_LABELS = [
 
 
 def _allowed_labels():
-
+    """Return the label list that Bedrock is allowed to use.
+    This keeps automatic labeling constrained to the same classes the model was trained on.
+    """
     raw = os.environ.get("ALLOWED_LABELS_JSON")
     return json.loads(raw) if raw else DEFAULT_LABELS
 
 
 def _threshold(value):
-
+    """Convert the confidence threshold into probability format.
+    This lets students pass either 0.65 or 65 and still get the same cutoff."""
     value = float(value)
     return value / 100.0 if value > 1 else value
 
 
 def _headers(event):
-
+    """Normalize API Gateway headers to lowercase keys.
+    This avoids bugs caused by Content-Type casing differences between clients."""
     return {k.lower(): v for k, v in (event.get("headers") or {}).items()}
 
 
 def _image_extension(content_type):
-
+    """Choose the file extension used when saving the uploaded image to S3.
+    This keeps saved examples easy to inspect later in the S3 console."""
     content_type = (content_type or "").lower()
     if "png" in content_type:
         return "png"
@@ -59,7 +63,8 @@ def _image_extension(content_type):
 
 
 def _bedrock_image_format(content_type):
-
+    """Convert the incoming image content type to the format name Bedrock expects.
+    This lets the same Lambda handle JPEG, PNG, and WebP uploads."""
     content_type = (content_type or "").lower()
     if "png" in content_type:
         return "png"
@@ -69,7 +74,8 @@ def _bedrock_image_format(content_type):
 
 
 def _parse_request(event):
-
+    """Extract the image bytes and confidence threshold from the API Gateway event.
+    This supports both JSON base64 uploads and binary image uploads."""
     headers = _headers(event)
     content_type = headers.get("content-type", "application/json")
     query = event.get("queryStringParameters") or {}
@@ -92,7 +98,8 @@ def _parse_request(event):
 
 
 def _invoke_endpoint(image_bytes):
-
+    """Send the image to the deployed SageMaker endpoint and return its prediction.
+    This is the bridge between the public API and the real-time model."""
     endpoint_name = os.environ["SAGEMAKER_ENDPOINT_NAME"]
     payload = {
         "image": base64.b64encode(image_bytes).decode("utf-8"),
@@ -108,7 +115,9 @@ def _invoke_endpoint(image_bytes):
 
 
 def _emit_metric(confidence, low_confidence, retraining_started):
-
+    """Write model confidence and retraining signals to CloudWatch metrics.
+    The dashboard reads these metrics to show whether the API is seeing weak predictions.
+    """
     namespace = os.environ.get("METRIC_NAMESPACE", "RecyclingClassifierCourse")
     print(
         json.dumps(
@@ -137,14 +146,19 @@ def _emit_metric(confidence, low_confidence, retraining_started):
 
 
 def _put_bytes(bucket, key, data, content_type):
-
+    """Save one byte payload to S3 with the right content type.
+    This helper keeps image, prediction, and label writes consistent."""
     s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type)
 
 
 def _save_low_confidence_example(image_bytes, content_type, prediction, threshold):
-
+    """Save a low-confidence API request as a pending feedback example in S3.
+    This creates the training signal that Bedrock can label and the pipeline can later retrain on.
+    """
     bucket = os.environ["LOW_CONFIDENCE_BUCKET"]
-    prefix = os.environ.get("LOW_CONFIDENCE_PREFIX", "recycling-classifier/low-confidence").strip("/")
+    prefix = os.environ.get(
+        "LOW_CONFIDENCE_PREFIX", "recycling-classifier/low-confidence"
+    ).strip("/")
     example_id = str(uuid.uuid4())
     base_key = f"{prefix}/pending/{example_id}"
     ext = _image_extension(content_type)
@@ -171,7 +185,9 @@ def _save_low_confidence_example(image_bytes, content_type, prediction, threshol
 
 
 def _list_pending_examples(bucket, root_prefix):
-
+    """Find complete pending examples that are ready for Bedrock labeling.
+    A complete example has an image and prediction metadata, and no previous label error.
+    """
     pending_prefix = f"{root_prefix.strip('/')}/pending/"
     paginator = s3.get_paginator("list_objects_v2")
     groups = {}
@@ -196,7 +212,9 @@ def _list_pending_examples(bucket, root_prefix):
 
 
 def _try_create_lock(bucket, key):
-
+    """Create a lightweight S3 lock so only one Lambda starts retraining at a time.
+    This prevents duplicate Bedrock labeling and duplicate pipeline executions during traffic bursts.
+    """
     try:
         s3.put_object(Bucket=bucket, Key=key, Body=b"locked", IfNoneMatch="*")
         return True
@@ -208,25 +226,30 @@ def _try_create_lock(bucket, key):
 
 
 def _delete_object(bucket, key):
-
+    """Delete one object from S3.
+    This is used to clean up locks and move pending examples after batching."""
     s3.delete_object(Bucket=bucket, Key=key)
 
 
 def _read_object_bytes(bucket, key):
-
+    """Read an S3 object and return its bytes plus content type.
+    Bedrock needs the raw image bytes, while the pipeline needs the saved metadata."""
     obj = s3.get_object(Bucket=bucket, Key=key)
     content_type = obj.get("ContentType", "image/jpeg")
     return obj["Body"].read(), content_type
 
 
 def _extract_bedrock_text(response):
-
+    """Extract plain text from the Bedrock Converse response.
+    Claude returns content blocks, so this turns them into one string we can parse."""
     content = response["output"]["message"]["content"]
     return "".join(block.get("text", "") for block in content if "text" in block)
 
 
 def _parse_label_json(text):
-
+    """Parse the label JSON returned by Bedrock.
+    This tolerates small formatting mistakes by extracting the first JSON object if extra text appears.
+    """
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -237,7 +260,9 @@ def _parse_label_json(text):
 
 
 def _bedrock_label_image(image_bytes, content_type, prediction):
-
+    """Ask Bedrock to choose one valid recycling label for a low-confidence image.
+    The prompt forces Claude to pick from the model's allowed labels so retraining stays supervised.
+    """
     labels = _allowed_labels()
     model_id = os.environ.get("BEDROCK_MODEL_ID", "global.anthropic.claude-sonnet-4-6")
     prompt = (
@@ -271,7 +296,9 @@ def _bedrock_label_image(image_bytes, content_type, prediction):
     payload = _parse_label_json(text)
     label = str(payload.get("label", "")).strip()
     if label not in labels:
-        raise ValueError(f"Bedrock returned invalid label {label!r}; allowed labels are {labels}")
+        raise ValueError(
+            f"Bedrock returned invalid label {label!r}; allowed labels are {labels}"
+        )
     return {
         "label": label,
         "confidence": float(payload.get("confidence", 0.0)),
@@ -282,41 +309,71 @@ def _bedrock_label_image(image_bytes, content_type, prediction):
     }
 
 
-def _copy_selected_to_batch(bucket, root_prefix, batch_id, example_id, keys, label_payload):
-
+def _copy_selected_to_batch(
+    bucket, root_prefix, batch_id, example_id, keys, label_payload
+):
+    """Move one labeled pending example into a retraining batch.
+    This creates the stable S3 layout that train.py reads during the pipeline training step.
+    """
     for key in keys:
-        destination = f"{root_prefix}/batches/{batch_id}/{example_id}/{PurePosixPath(key).name}"
-        s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": key}, Key=destination)
+        destination = (
+            f"{root_prefix}/batches/{batch_id}/{example_id}/{PurePosixPath(key).name}"
+        )
+        s3.copy_object(
+            Bucket=bucket, CopySource={"Bucket": bucket, "Key": key}, Key=destination
+        )
         _delete_object(bucket, key)
     label_key = f"{root_prefix}/batches/{batch_id}/{example_id}/label.json"
-    _put_bytes(bucket, label_key, json.dumps(label_payload, indent=2).encode("utf-8"), "application/json")
+    _put_bytes(
+        bucket,
+        label_key,
+        json.dumps(label_payload, indent=2).encode("utf-8"),
+        "application/json",
+    )
 
 
 def _write_pending_label(bucket, root_prefix, example_id, label_payload):
-
+    """Save a valid Bedrock label back into the pending folder.
+    This preserves good labels when a full batch cannot be formed yet."""
     label_key = f"{root_prefix}/pending/{example_id}/label.json"
-    _put_bytes(bucket, label_key, json.dumps(label_payload, indent=2).encode("utf-8"), "application/json")
+    _put_bytes(
+        bucket,
+        label_key,
+        json.dumps(label_payload, indent=2).encode("utf-8"),
+        "application/json",
+    )
 
 
 def _write_label_error(bucket, root_prefix, example_id, error_message):
-
+    """Record that Bedrock labeling failed for one example.
+    This prevents the same bad example from being retried automatically forever."""
     key = f"{root_prefix}/pending/{example_id}/label_error.json"
     payload = {"error": error_message, "failed_at_epoch": int(time.time())}
-    _put_bytes(bucket, key, json.dumps(payload, indent=2).encode("utf-8"), "application/json")
+    _put_bytes(
+        bucket, key, json.dumps(payload, indent=2).encode("utf-8"), "application/json"
+    )
 
 
 def _maybe_label_and_start_retraining():
-
+    """Check whether enough low-confidence examples exist, label them, and start retraining.
+    This function is the automation gate between API feedback collection and the SageMaker Pipeline.
+    """
     pipeline_name = os.environ.get("PIPELINE_NAME")
     if not pipeline_name:
         return {"started": False, "reason": "PIPELINE_NAME is not configured"}
 
     bucket = os.environ["LOW_CONFIDENCE_BUCKET"]
-    root_prefix = os.environ.get("LOW_CONFIDENCE_PREFIX", "recycling-classifier/low-confidence").strip("/")
+    root_prefix = os.environ.get(
+        "LOW_CONFIDENCE_PREFIX", "recycling-classifier/low-confidence"
+    ).strip("/")
     min_items = int(os.environ.get("MIN_RETRAIN_ITEMS", "3"))
     examples = _list_pending_examples(bucket, root_prefix)
     if len(examples) < min_items:
-        return {"started": False, "pending_examples": len(examples), "required_examples": min_items}
+        return {
+            "started": False,
+            "pending_examples": len(examples),
+            "required_examples": min_items,
+        }
 
     lock_key = f"{root_prefix}/locks/retrain.lock"
     if not _try_create_lock(bucket, lock_key):
@@ -329,19 +386,34 @@ def _maybe_label_and_start_retraining():
 
         for example_id, keys in selected:
             names_to_keys = {PurePosixPath(key).name: key for key in keys}
-            image_key = next(key for name, key in names_to_keys.items() if name.startswith("image."))
+            image_key = next(
+                key for name, key in names_to_keys.items() if name.startswith("image.")
+            )
             prediction_key = names_to_keys["prediction.json"]
-            prediction = json.loads(_read_object_bytes(bucket, prediction_key)[0].decode("utf-8"))["prediction"]
+            prediction = json.loads(
+                _read_object_bytes(bucket, prediction_key)[0].decode("utf-8")
+            )["prediction"]
 
             if "label.json" in names_to_keys:
-                label_payload = json.loads(_read_object_bytes(bucket, names_to_keys["label.json"])[0].decode("utf-8"))
+                label_payload = json.loads(
+                    _read_object_bytes(bucket, names_to_keys["label.json"])[0].decode(
+                        "utf-8"
+                    )
+                )
                 if label_payload.get("label") not in _allowed_labels():
-                    _write_label_error(bucket, root_prefix, example_id, "stored label is not in allowed labels")
+                    _write_label_error(
+                        bucket,
+                        root_prefix,
+                        example_id,
+                        "stored label is not in allowed labels",
+                    )
                     continue
             else:
                 image_bytes, content_type = _read_object_bytes(bucket, image_key)
                 try:
-                    label_payload = _bedrock_label_image(image_bytes, content_type, prediction)
+                    label_payload = _bedrock_label_image(
+                        image_bytes, content_type, prediction
+                    )
                 except Exception as exc:
                     _write_label_error(bucket, root_prefix, example_id, str(exc))
                     continue
@@ -351,10 +423,16 @@ def _maybe_label_and_start_retraining():
         if len(labeled_items) < min_items:
             for example_id, _, label_payload in labeled_items:
                 _write_pending_label(bucket, root_prefix, example_id, label_payload)
-            return {"started": False, "reason": "not enough valid Bedrock labels", "labeled_examples": len(labeled_items)}
+            return {
+                "started": False,
+                "reason": "not enough valid Bedrock labels",
+                "labeled_examples": len(labeled_items),
+            }
 
         for example_id, keys, label_payload in labeled_items:
-            _copy_selected_to_batch(bucket, root_prefix, batch_id, example_id, keys, label_payload)
+            _copy_selected_to_batch(
+                bucket, root_prefix, batch_id, example_id, keys, label_payload
+            )
 
         batch_s3_uri = f"s3://{bucket}/{root_prefix}/batches/{batch_id}/"
         parameters = [
@@ -376,16 +454,28 @@ def _maybe_label_and_start_retraining():
 
 
 def lambda_handler(event, context):
-
+    """Handle one API Gateway request from image upload through optional retraining trigger.
+    It returns the model prediction immediately and starts feedback collection when confidence is low.
+    """
     image_bytes, content_type, threshold = _parse_request(event)
     prediction = _invoke_endpoint(image_bytes)
+    if isinstance(prediction, list):
+        prediction = prediction[0]
+
+    if isinstance(prediction, bytes):
+        prediction = prediction.decode("utf-8")
+
+    if isinstance(prediction, str):
+        prediction = json.loads(prediction)
     confidence = float(prediction["confidence"])
     low_confidence = confidence < threshold
 
     saved_s3_uri = None
     retraining = {"started": False}
     if low_confidence:
-        saved_s3_uri = _save_low_confidence_example(image_bytes, content_type, prediction, threshold)
+        saved_s3_uri = _save_low_confidence_example(
+            image_bytes, content_type, prediction, threshold
+        )
         retraining = _maybe_label_and_start_retraining()
 
     _emit_metric(confidence, low_confidence, retraining.get("started", False))

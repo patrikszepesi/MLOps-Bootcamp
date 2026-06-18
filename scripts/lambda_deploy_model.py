@@ -7,13 +7,14 @@ from urllib.parse import urlparse
 import boto3
 from botocore.exceptions import ClientError
 
-
 sm = boto3.client("sagemaker")
 s3 = boto3.client("s3")
 
 
 def _safe_name(prefix):
-
+    """Create a unique SageMaker resource name from a readable prefix.
+    This prevents model and endpoint-config name collisions every time the pipeline deploys a candidate.
+    """
     cleaned = re.sub(r"[^A-Za-z0-9-]", "-", prefix).strip("-")
     suffix = str(int(time.time()))
     max_prefix = 63 - len(suffix) - 1
@@ -21,7 +22,8 @@ def _safe_name(prefix):
 
 
 def _parse_s3_uri(uri):
-
+    """Split an S3 URI into the bucket and object key that boto3 needs.
+    This is used when writing the current deployed model's metric record back to S3."""
     parsed = urlparse(uri)
     if parsed.scheme != "s3" or not parsed.netloc:
         raise ValueError(f"Expected s3:// URI, got {uri!r}")
@@ -29,7 +31,9 @@ def _parse_s3_uri(uri):
 
 
 def _endpoint_exists(endpoint_name):
-
+    """Check whether the production endpoint already exists.
+    The deploy Lambda uses this to choose between creating the endpoint once or updating it later.
+    """
     try:
         sm.describe_endpoint(EndpointName=endpoint_name)
         return True
@@ -41,7 +45,9 @@ def _endpoint_exists(endpoint_name):
 
 
 def _put_current_metrics(uri, payload):
-
+    """Write the new deployed model's metrics and metadata to S3.
+    Future pipeline runs compare against this record before deciding whether to deploy a new candidate.
+    """
     bucket, key = _parse_s3_uri(uri)
     s3.put_object(
         Bucket=bucket,
@@ -52,7 +58,9 @@ def _put_current_metrics(uri, payload):
 
 
 def lambda_handler(event, context):
-
+    """Deploy a pipeline-approved model candidate to the real-time endpoint.
+    This creates a new SageMaker model and endpoint config, then creates or updates the stable endpoint name.
+    """
     endpoint_name = event["endpoint_name"]
     model_data = event["model_data"]
     role_arn = event["role_arn"]
